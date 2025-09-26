@@ -1,7 +1,5 @@
 #include <ceres/ceres.h>
 #include <opencv2/opencv.hpp>
-
-// 标准库头文件：用于数值计算、文件系统、格式化输出等功能
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
@@ -329,11 +327,6 @@ int main() {
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
 
-    if (!summary.IsSolutionUsable()) {
-        std::cerr << "弹道模型拟合失败。" << std::endl;
-        std::cerr << summary.FullReport() << std::endl;
-        return 1;
-    }
 
     // 读取求解后的参数
     BallisticParams fitted;
@@ -362,20 +355,12 @@ int main() {
     const std::filesystem::path resultsDir("results");
     std::error_code ec;
     std::filesystem::create_directories(resultsDir, ec);
-    if (ec) {
-        std::cerr << "创建结果目录失败: " << ec.message() << std::endl;
-        return 1;
-    }
 
     const std::filesystem::path plotPath = resultsDir / "trajectory_plot.png";
     drawTrajectoryPlot(deltaTimes, centersUp, fitted, plotPath.string());
 
     // 再次读取原视频，用于叠加拟合曲线并写出新视频
     cv::VideoCapture playback(videoPath);
-    if (!playback.isOpened()) {
-        std::cerr << "无法重新打开视频用于写出结果。" << std::endl;
-        return 1;
-    }
 
     int width = static_cast<int>(playback.get(cv::CAP_PROP_FRAME_WIDTH));
     int height = static_cast<int>(playback.get(cv::CAP_PROP_FRAME_HEIGHT));
@@ -463,9 +448,6 @@ int main() {
 
     playback.release();
     writer.release();
-
-    std::cout << "结果图像保存至: " << plotPath << std::endl;
-    std::cout << "叠加结果视频保存至: " << videoOutputPath << std::endl;
 
     return 0;
 }
