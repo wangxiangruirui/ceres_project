@@ -222,11 +222,6 @@ std::string formatEquation(const BallisticParams& params) {
 int main() {
     const std::string videoPath = "resources/video.mp4";
     cv::VideoCapture capture(videoPath);
-    if (!capture.isOpened()) {
-        std::cerr << "无法打开视频文件: " << videoPath << std::endl;
-        return 1;
-    }
-
     const double fps = 60.0;  // 题目给定的视频帧率，用来把帧序号转换成时间
 
     // deltaTimes: 每个检测点对应的 Δt；centersImage: 图像坐标（向下为正）
@@ -269,11 +264,6 @@ int main() {
     }
 
     capture.release();
-
-    if (centersUp.size() < 5) {
-        std::cerr << "检测到的圆心数量不足以拟合弹道模型。" << std::endl;
-        return 1;
-    }
 
     if (frameHeight <= 0) {
         double maxY = centersImage.front().y;
@@ -381,10 +371,6 @@ int main() {
     if (!writer.isOpened()) {
         fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
         writer.open(videoOutputPath.string(), fourcc, fps, cv::Size(width, height));
-    }
-    if (!writer.isOpened()) {
-        std::cerr << "无法创建输出视频文件。" << std::endl;
-        return 1;
     }
 
     std::vector<cv::Point> fittedPath;
