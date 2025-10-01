@@ -7,7 +7,9 @@
 #include <iomanip>
 #include <cmath>
 #include <thread>
+#include <algorithm>
 struct BallisticParams { double x0, y0, vx0, vy0, g, k; };
+struct Detection { cv::Point2d center; double radius; bool fromHough; };
 struct Residual {
 	Residual(double dt_, double ox_, double oy_) : dt(dt_), ox(ox_), oy(oy_) {}
 	template <class T>
@@ -23,32 +25,90 @@ struct Residual {
 	double dt, ox, oy;
 };
 
-static std::optional<cv::Point2d> detectBallCenter(const cv::Mat& frame) {
-	if (frame.empty()) return std::nullopt;
-	cv::Mat gray; cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-	cv::GaussianBlur(gray, gray, cv::Size(7, 7), 1.5);
-	std::vector<cv::Vec3f> circles;
-	cv::HoughCircles(gray, circles, cv::HOUGH_GRADIENT, 1.2,
-					 static_cast<double>(gray.rows) / 16.0, 120, 20, 3, 0);
-	if (!circles.empty()) return cv::Point2d(circles[0][0], circles[0][1]);
+static std::optional<Detection> detectByContours(const cv::Mat& image, std::optional<double> expectedRadius = std::nullopt) {
+	if (image.empty()) return std::nullopt;
+	cv::Mat gray;
+	if (image.channels() == 1) gray = image;
+	else cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+	cv::GaussianBlur(gray, gray, cv::Size(5, 5), 1.0);
+	int minDim = std::min(gray.rows, gray.cols);
+	int block = minDim >= 11 ? 11 : (minDim | 1);
+	if (block < 3) block = 3;
+	if ((block & 1) == 0) ++block;
 	cv::Mat binary;
 	cv::adaptiveThreshold(gray, binary, 255, cv::ADAPTIVE_THRESH_GAUSSIAN_C,
-						  cv::THRESH_BINARY_INV, 11, 2);
-	cv::morphologyEx(binary, binary, cv::MORPH_OPEN,
-					 cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
+						  cv::THRESH_BINARY_INV, block, 2);
+	int kernelSize = minDim >= 5 ? 5 : 3;
+	cv::Mat element = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(kernelSize, kernelSize));
+	cv::morphologyEx(binary, binary, cv::MORPH_OPEN, element);
 	std::vector<std::vector<cv::Point>> contours;
 	cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-	double bestArea = 0.0; cv::Point2d bestCenter;
+	double minArea = std::max(5.0, 0.0005 * static_cast<double>(gray.rows) * gray.cols);
+	double maxArea = 0.4 * static_cast<double>(gray.rows) * gray.cols;
+	double bestScore = 0.0;
+	Detection best{};
+	best.fromHough = false;
 	for (const auto& contour : contours) {
 		double area = cv::contourArea(contour);
-		if (area < 10.0) continue;
-		cv::Moments m = cv::moments(contour);
-		if (std::abs(m.m00) < 1e-5) continue;
-		cv::Point2d center(m.m10 / m.m00, m.m01 / m.m00);
-		if (area > bestArea) { bestArea = area; bestCenter = center; }
+		if (area < minArea || area > maxArea) continue;
+		double perimeter = cv::arcLength(contour, true);
+		if (perimeter < 1e-5) continue;
+		double circularity = 4.0 * CV_PI * area / (perimeter * perimeter + 1e-6);
+		if (circularity < 0.6) continue;
+		cv::Point2f centerF; float radiusF;
+		cv::minEnclosingCircle(contour, centerF, radiusF);
+		if (radiusF < 3.0f || radiusF > 80.0f) continue;
+		double radiusWeight = 1.0;
+		if (expectedRadius) radiusWeight = 1.0 / (1.0 + std::abs(radiusF - *expectedRadius));
+		double score = circularity * area * radiusWeight;
+		if (score > bestScore) {
+			bestScore = score;
+			best.center = cv::Point2d(centerF.x, centerF.y);
+			best.radius = radiusF;
+			best.fromHough = false;
+		}
 	}
-	if (bestArea > 0.0) return bestCenter;
+	if (bestScore > 0.0) return best;
 	return std::nullopt;
+}
+
+static std::optional<Detection> detectByHough(const cv::Mat& image, std::optional<double> expectedRadius = std::nullopt) {
+	if (image.empty()) return std::nullopt;
+	cv::Mat gray;
+	if (image.channels() == 1) gray = image;
+	else cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+	cv::GaussianBlur(gray, gray, cv::Size(7, 7), 1.5);
+	std::vector<cv::Vec3f> circles;
+	int minRadius = 3;
+	int maxRadius = std::min({ std::max(gray.rows, gray.cols) / 2, 120 });
+	if (expectedRadius) {
+		minRadius = std::max(3, (int)std::round(*expectedRadius * 0.7));
+		maxRadius = std::max(minRadius + 2, (int)std::round(*expectedRadius * 1.4));
+	}
+	cv::HoughCircles(gray, circles, cv::HOUGH_GRADIENT, 1.2,
+					 static_cast<double>(gray.rows) / 16.0, 120, 18, minRadius, maxRadius);
+	if (!circles.empty()) {
+		Detection d;
+		d.center = cv::Point2d(circles[0][0], circles[0][1]);
+		d.radius = circles[0][2];
+		d.fromHough = true;
+		return d;
+	}
+	return std::nullopt;
+}
+
+
+static std::optional<Detection> detectBallCenter(const cv::Mat& frame, const cv::Rect* roi = nullptr, bool allowHough = true, std::optional<double> expectedRadius = std::nullopt) {
+	const cv::Mat region = roi ? frame(*roi) : frame;
+	std::optional<Detection> result;
+	if (allowHough) result = detectByHough(region, expectedRadius);
+	if (!result) result = detectByContours(region, expectedRadius);
+	if (!result && allowHough && !expectedRadius) result = detectByHough(region, expectedRadius);
+	if (result && roi) {
+		result->center.x += roi->x;
+		result->center.y += roi->y;
+	}
+	return result;
 }
 
 static std::string eq(const BallisticParams& p) {
@@ -64,22 +124,54 @@ int main() {
 	if (!cap.isOpened()) return 1;
 	const double fps = 60.0;
 	int frameCount = (int)cap.get(cv::CAP_PROP_FRAME_COUNT);
-	if (frameCount < 0) frameCount = 0; // some codecs may not provide
+	if (frameCount < 0) frameCount = 0;
 	std::vector<double> ts; ts.reserve(frameCount);
 	std::vector<cv::Point2d> pts; pts.reserve(frameCount);
 	cv::Mat f;
 	int idx = 0;
 	double t0 = -1;
-	int H = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT); if (H <= 0) H = 0;
+	int H = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+	if (H <= 0) H = 0;
+	std::optional<Detection> last;
 	while (cap.read(f)) {
 		double t = idx / fps;
-		auto c = detectBallCenter(f);
-		if (c) {
+		std::optional<Detection> detect;
+		cv::Rect roi;
+		if (last && f.cols > 0 && f.rows > 0) {
+			double searchRadius = std::clamp(last->radius * 2.5, 20.0, 200.0);
+			int r = std::max(10, (int)std::round(searchRadius));
+			int maxX = std::max(f.cols - 1, 0);
+			int maxY = std::max(f.rows - 1, 0);
+			int cx = (int)std::round(last->center.x);
+			int cy = (int)std::round(last->center.y);
+			int x = std::clamp(cx - r, 0, maxX);
+			int y = std::clamp(cy - r, 0, maxY);
+			int w = std::min(r * 2, f.cols - x);
+			int h = std::min(r * 2, f.rows - y);
+			if (w > 0 && h > 0) {
+				roi = cv::Rect(x, y, w, h);
+				detect = detectBallCenter(f, &roi, true, last->radius);
+			}
+		}
+		std::optional<double> expectedRadius;
+		if (last) expectedRadius = last->radius;
+		if (!detect) detect = detectBallCenter(f, nullptr, true, expectedRadius);
+		if (detect && last) {
+			double dist = cv::norm(detect->center - last->center);
+			double maxJump = std::max(last->radius * 4.0, 80.0);
+			if (dist > maxJump) {
+				detect = detectBallCenter(f, nullptr, true, last->radius);
+			}
+		}
+		if (detect) {
+			last = detect;
 			if (t0 < 0) t0 = t;
 			double dt = t - t0;
-			double yup = (H ? H : f.rows) - c->y;
+			double yup = (H ? H : f.rows) - detect->center.y;
 			ts.push_back(dt);
-			pts.emplace_back(c->x, yup);
+			pts.emplace_back(detect->center.x, yup);
+		} else {
+			last.reset();
 		}
 		++idx;
 	}
@@ -112,12 +204,13 @@ int main() {
 	prob.SetParameterUpperBound(param, 4, 1000);
 	prob.SetParameterLowerBound(param, 5, 0.01);
 	prob.SetParameterUpperBound(param, 5, 1.0);
-	ceres::Solver::Options opt; 
-	opt.linear_solver_type = ceres::DENSE_QR; 
-	opt.max_num_iterations = 200; 
+	ceres::Solver::Options opt;
+	opt.linear_solver_type = ceres::DENSE_QR;
+	opt.max_num_iterations = 200;
 	opt.num_threads = std::thread::hardware_concurrency();
 	opt.minimizer_progress_to_stdout = false;
-	ceres::Solver::Summary sum; ceres::Solve(opt, &prob, &sum);
+	ceres::Solver::Summary sum;
+	ceres::Solve(opt, &prob, &sum);
 	BallisticParams r{ param[0], param[1], param[2], param[3], param[4], param[5] };
 	size_t n = ts.size() * 2;
 	double mean = std::sqrt(2 * sum.final_cost / n);
